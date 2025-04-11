@@ -1,294 +1,228 @@
-library(ggplot2)
-library(ggsoccer)
-library(dplyr)
-library(purrr)
-library(sf)
-library(scales)
-library(geometry)
-library(units)
-library(jsonlite)
-library(tidyr)
-library(logr)
-library(futile.logger)
-library(mongolite)
-library(stringr)
-library(plotly)
-library(tibble)
-library(StatsBombR)
-
-tracking_meta <- fromJSON("tracking_meta.json")
-tracking <- fromJSON("tracking.json")
-
-tracking <- tracking %>%
-  mutate(teamname = case_when(
-    lastTouch == "away" ~ "OB",
-    lastTouch == "home" ~ "VB",
-    TRUE ~ "fejl"
-  ))
-
-rescale_coords <- function(df, x_col, y_col, from_x = c(-52.5, 52.5), from_y = c(-44, 44)) {
-  df %>% mutate(
-    x = rescale(.data[[x_col]], to = c(0, 120), from = from_x),
-    y = rescale(.data[[y_col]], to = c(0, 80), from = from_y)
-  )
-}
-
-extract_positions <- function(players_df, team_name) {
-  if (is.null(players_df) || nrow(players_df) == 0) return(data.frame())
-  players_df %>%
-    mutate(
-      x = map_dbl(xyz, ~ if (length(.) >= 1) as.numeric(.[[1]]) else NA),
-      y = map_dbl(xyz, ~ if (length(.) >= 2) as.numeric(.[[2]]) else NA),
-      team = team_name,
-      id = if ("playerId" %in% colnames(players_df)) players_df$playerId else NA
-    ) %>%
-    select(team, id, x, y)
-}
-
-create_trapezoid_polygon <- function(ball, player, width_start = 0.5, width_end = 1, label = "A") {
-  dx <- player$x - ball$x
-  dy <- player$y - ball$y
-  angle <- atan2(dy, dx)
-  perp <- pi / 2
-  
-  p1 <- c(ball$x + width_start * cos(angle + perp), ball$y + width_start * sin(angle + perp))
-  p2 <- c(player$x + width_end * cos(angle + perp), player$y + width_end * sin(angle + perp))
-  p3 <- c(player$x + width_end * cos(angle - perp), player$y + width_end * sin(angle - perp))
-  p4 <- c(ball$x + width_start * cos(angle - perp), ball$y + width_start * sin(angle - perp))
-  
-  tibble(
-    x = c(p1[1], p2[1], p3[1], p4[1], p1[1]),
-    y = c(p1[2], p2[2], p3[2], p4[2], p1[2]),
-    group = label
-  )
-}
-
-plot_tracking_frame <- function(tracking, tracking_meta, frame_index = 1) {
-  frame_data <- tracking[frame_index, ]
-  home_df <- extract_positions(frame_data$homePlayers[[1]], "VB")
-  away_df <- extract_positions(frame_data$awayPlayers[[1]], "OB")
-  
-  ball_df <- tryCatch({
-    coords <- unlist(frame_data$ball$xyz)
-    if (length(coords) >= 2) tibble(x = as.numeric(coords[1]), y = as.numeric(coords[2])) else NULL
-  }, error = function(e) NULL)
-  
-  all_players <- bind_rows(home_df, away_df)
-  meta_df <- bind_rows(tracking_meta$homePlayers, tracking_meta$awayPlayers)
-  
-  all_players <- left_join(all_players, meta_df, by = c("id" = "ssiId")) %>%
-    mutate(label = ifelse(!is.na(name), name, substr(id, 1, 5)))
-  
-  all_players <- rescale_coords(all_players, "x", "y")
-  if (!is.null(ball_df)) {
-    ball_df <- rescale_coords(ball_df, "x", "y")
-  }
-  
-  triangle_list <- list()
-  highlight_idx <- NULL
-  
-  if (!is.null(ball_df)) {
-    last_touch <- frame_data$lastTouch[[1]]
-    modtagere <- if (last_touch == "home") home_df else if (last_touch == "away") away_df else NULL
-    modstandere <- if (last_touch == "home") away_df else if (last_touch == "away") home_df else NULL
-    
-    if (!is.null(modtagere)) {
-      modtagere <- rescale_coords(modtagere, "x", "y")
-      modstandere <- rescale_coords(modstandere, "x", "y")
-      max_x <- if (last_touch == "home") -Inf else Inf
-      
-      for (i in 1:nrow(modtagere)) {
-        m <- modtagere[i, ]
-        poly_df <- create_trapezoid_polygon(ball_df, m, 0.5, 1, label = i)
-        
-        poly_path <- sf::st_polygon(list(cbind(poly_df$x, poly_df$y)))
-        blocked <- any(sapply(1:nrow(modstandere), function(j) {
-          pt <- sf::st_point(c(modstandere$x[j], modstandere$y[j]))
-          sf::st_intersects(sf::st_sfc(poly_path), sf::st_sfc(pt), sparse = FALSE)[1, 1]
-        }))
-        
-        poly_df$blocked <- blocked
-        poly_df$highlight <- FALSE
-        triangle_list[[i]] <- poly_df
-        
-        if (!blocked) {
-          if (last_touch == "home" && m$x > max_x) {
-            max_x <- m$x; highlight_idx <- i
-          } else if (last_touch == "away" && m$x < max_x) {
-            max_x <- m$x; highlight_idx <- i
-          }
-        }
-      }
-      
-      all_polygons <- bind_rows(triangle_list)
-      if (!is.null(highlight_idx)) {
-        all_polygons$highlight[all_polygons$group == highlight_idx] <- TRUE
-      }
-    }
-  }
-  
-  ggplot() +
-    annotate_pitch(dimensions = pitch_statsbomb, fill = "#60A561", colour = "white") +
-    theme_pitch() +
-    theme(panel.background = element_rect(fill = "#60A561")) +
-    {if (exists("all_polygons")) geom_polygon(data = all_polygons,
-                                              aes(x = x, y = y, group = group,
-                                                  fill = ifelse(highlight, "green", ifelse(blocked, "red", "blue")),
-                                                  alpha = ifelse(highlight, 0.4, ifelse(blocked, 0.2, 0.1))), color = NA)} +
-    geom_point(data = all_players, aes(x = x, y = y, color = team), size = 4) +
-    scale_color_manual(values = c("OB" = "blue1", "VB" = "red1")) +
-    geom_text(data = all_players, aes(x = x, y = y, label = label), size = 5.5) +
-    {if (!is.null(ball_df)) geom_point(data = ball_df, aes(x = x, y = y), fill = "white", color = "black", shape = 21, size = 4)} +
-    scale_fill_identity() +
-    scale_alpha_identity() +
-    coord_cartesian(xlim = c(0, 120), ylim = c(0, 80)) +
-    theme(aspect.ratio = 2 / 3) +
-    scale_y_reverse() +
-    ggtitle(paste0("Frame ", frame_data$frameIdx))
-}
-#### active play ####
-activeplay <- tracking[tracking$live == TRUE, ]
-
-bbsidelse <- tibble(
-  hold = c("OB", "VB"),
-  antal_frames = c(46430, 37362)
-) %>%
-  mutate(
-    total = sum(antal_frames),
-    procent = antal_frames / total
-  )
-
-ggplot(bbsidelse, aes(x = 1, y = procent, fill = hold)) +
-  geom_col(width = 0.4) +
-  coord_flip() +
-  scale_fill_manual(values = c("OB" = "blue", "VB" = "red")) +
-  geom_text(aes(label = paste0(round(procent * 100), "%")),
-            position = position_stack(vjust = 0.5),
-            color = "white", size = 6) +
-  theme_void() +
-  theme(
-    legend.position = "none",
-    plot.background = element_rect(fill = "#002b7f", color = NA),
-    plot.margin = margin(10, 10, 10, 10)
-  )
-
-#### SHINY ####
 library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(ggsoccer)
+library(factoextra)
+library(cluster)
+library(corrplot)
+library(tidyr)
+library(DT)
 
-ui <- fluidPage(
-  tags$head(
-    tags$style(HTML(" 
-      body { background-color: #002b7f; }
-      .navbar { background-color: #002b7f !important; }
-      .navbar-default .navbar-brand { color: white !important; font-weight: bold; }
-      .btn-primary { background-color: #ffd700; border-color: #ffd700; color: black; }
-      .btn-primary:hover { background-color: #ffc300; border-color: #ffc300; color: black; }
-      .control-buttons { text-align: center; padding: 30px; }
-      .info-box {
-        background-color: #fffbea;
-        border: 1px solid #ccc;
-        border-radius: 5px;
-        padding: 15px;
-        margin-top: 15px;
-        font-size: 15px;
-      }
-    "))
+#setwd("/Users/lukasbachcouzy/Documents/DAL-Projects/2.semester/EksamenF25/Clusterpics/Cluster")
+
+
+allpasses <- readRDS("allpasses.rds")
+player_stats <- readRDS("player_stats.rds")
+pass_data_scaled <- readRDS("pass_data_scaled.rds")
+data.pca <- readRDS("data_pca.rds")
+dftwss <- readRDS("dftwss.rds")
+
+
+#### --- DATAINDSAMLING FRA MARIADB --- #####
+
+pass_data <- allpasses %>% select(ANGLE, LENGTH, LOCATIONX, LOCATIONY, player_avgpass)
+
+
+set.seed(123)
+k_default <- 8
+kmod <- kmeans(pass_data_scaled, centers = k_default, nstart = 10)
+pass_data$cluster <- as.factor(kmod$cluster)
+
+
+
+
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(ggsoccer)
+library(DT)
+library(factoextra)
+
+# --- CLUSTER BESKRIVELSER --- #
+cluster_labels <- list(
+  "1" = list(
+    title = "Opbyggende afleveringer fra bagkæden",
+    desc = "Afleveringerne i dette cluster starter dybt i egen banehalvdel og har karakter af at være opbyggende – med lange, flade afleveringer frem mod midtbanen eller det centrale angrebsområde. Typisk udført af forsvarsspillere med ansvar for spillets igangsættelse."
   ),
-  
-  navbarPage("Trackinganalyse",
-             tabPanel("Visualisering",
-                      sidebarLayout(
-                        sidebarPanel(
-                          div(class = "control-buttons",
-                              actionButton("prev", "<< Forrige", class = "btn btn-primary btn-lg"),
-                              actionButton("næste", "Næste >>", class = "btn btn-primary btn-lg"),
-                              br(), br(),
-                              sliderInput("frame", "Vælg frame:", min = 1, max = nrow(tracking), value = 1, step = 100),
-                              actionButton("play", "Afspil", class = "btn btn-primary btn-lg"),
-                              actionButton("stop", "Stop", class = "btn btn-primary btn-lg")
-                          ),
-                          div(class = "info-box",
-                              HTML(" <strong>Brugsanvisning:</strong><br>
-                Brug knapperne til at navigere frem og tilbage mellem frames.<br>
-                <br>
-                'Afspil' starter automatisk afspilning af hver 25. frame.<br>
-                <br>
-                 Du kan bruge slideren til at hoppe mellem frames.<br>
-                <br>
-                <strong>Afleveringsindikationer</strong><br>
-                <br>
-                De grønne polygoner symboliserer den spiller som er længst fremme på modstanders bane og fri. <br>
-                <br>
-                De røde poligoner symboliserer at der er en modspiller mellem. <br>
-                <br>
-                De blå poligoner symboliserer frie spillere, men ikke dem som er længst fremme på banen.")
-                          )
-                        ),
-                        mainPanel(
-                          plotOutput("plot", height = "700px"),
-                          div(style = "background-color: #fffbea; border: 1px solid #ccc; border-radius: 5px;
-               padding: 15px; margin-top: 20px; font-size: 15px;text-align: center;",
-                              HTML("<strong>'Live' boldbesidelse:</strong><br>
-                  Blå viser OB's boldbesiddelse, Rød viser VB's."),  
-                              plotOutput("possession_plot", height = "80px")
-                          )
-                        )
-                      )
-             )
+  "2" = list(
+    title = "Skarpe fra højre midt",
+    desc = "Afleveringerne udspringer fra højre midtbane og bliver splillet ind i modstanderens højre forsvarszone."
+  ),
+  "3" = list(
+    title = "Fremadrettede afleveringer fra højre forsvar",
+    desc = "Dette cluster dækker sikre, afleveringer fra højre forsvar mod centrale og venstre offensive områder. Typisk brugt til at sætte angreb i gang fra dybden – med stor præcision og god boldkontrol i opspillet."
+  ),
+  "4" = list(
+    title = "Midtbanens distribution",
+    desc = "Afleveringerne starter primært fra den centrale midtbane og fordeles symmetrisk til begge sider. Slutpositionerne samles i offensiv tredjedel med lav vinkel og høj præcision. Dette tyder på, at clusteret omfatter dybtliggende playmakere og midtbanespillere med ansvar for at kontrollere spillets rytme og fordele bolden bredt."
+  ),
+  "5" = list(
+    title = "Venstresidens offensive indlæg",
+    desc = "Afleveringerne i dette cluster starter overvejende fra den venstre midtbane og fløjen i den offensive halvdel. De ender typisk i eller omkring feltet, ofte fra indlægssituationer med høj vinkel og indadgående retning. Klyngen indikerer spillere, der ofte opererer som venstrekant eller wingback med indlægsansvar"
+  ),
+  "6" = list(
+    title = "Højrerekantens indadgående oplæg",
+    desc = "Afleveringerne i dette cluster starter konsekvent fra den højre offensive zone tæt på sidelinjen og bevæger sig ind mod feltet, hvilket er klassisk for en venstrekantspiller eller offensiv back, der søger at ramme medspillere i feltet. Mønstret afspejler et fokus på indlæg fra højresiden med høj præcision."
+  ),
+  "7" = list(
+    title = "IVenstrefløjens direkte indspil",
+    desc = "Afleveringerne i dette cluster udspringer primært fra venstresiden tæt ved midterlinjen og spilles direkte frem mod farezonen. Mønstret viser en tendens til at føre bolden op gennem banen uden store vinkler – en stil præget af effektivitet og direkte spil. Med høj præcision og kort længde tyder det på sikre afleveringer i en offensiv fase, ofte udført af venstrekant eller offensiv back."
+  ),
+  "8" = list(
+    title = "Venstresidens dybe opspil",
+    desc = "Afleveringerne starter dybt i venstre forsvar og midtbane og føres fremad mod centrale og højresidede områder tæt på feltet. Det indikerer en spilopbygning fra venstre side, hvor bolden skiftes over til modsat flanke eller centralt område for at åbne modstanderen. Med en moderat længde og høj præcision viser det et stabilt og velovervejet opspil."
   )
 )
 
+# --- UI --- #
+ui <- dashboardPage(
+  dashboardHeader(title = "K-Means Clustering Dashboard"),
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Info", tabName = "info", icon = icon("info-circle")),
+      menuItem("Cluster Explorer", tabName = "explorer", icon = icon("search"))
+    )
+  ),
+  dashboardBody(
+    tabItems(
+      tabItem(tabName = "info",
+              box(width = 12, title = "Velkommen", status = "primary", solidHeader = TRUE,
+                  HTML("<h3>Analyse af afleveringsmønstre i Superligaen</h3><br><p>Vi har udført en clustering analyse, som vil sige at vi har gennem afleveringsdata skabt grupper af spiller, som har samme afleveringsmønstre.<br>Denne applikation skal hjælpe modtageren med at skabe et bedre overblik over hvilke typer afleveringer bliver skabt af de forskellige spillere i <strong>Superligaen</strong>.<br> Afleveringsdataen er baseret på sæsonerne 23/24 og en stor del af 24/25.<br><br><strong>Under Cluster explorer ser vi vores analyse</strong>, hvor vi via en dropdown kan vælge at studere de forskellige grupper af spillere, gennem heatmaps for hele gruppen, og en beskrivende overskrift til lettere formodling. </p>")
+              )),
+      tabItem(tabName = "explorer",
+              fluidRow(
+                box(width = 3, title = "Indstillinger", status = "info", solidHeader = TRUE,
+                    selectInput("cluster_choice", "Vælg cluster:", choices = 1:8),
+                    htmlOutput("cluster_info_box")
+                ),
+                box(
+                  width = 9, 
+                  title = textOutput("heatmap_box_title"),
+                  status = "primary", 
+                  solidHeader = TRUE,
+                  fluidRow(
+                    column(6, plotOutput("heatmap_start")),
+                    column(6, plotOutput("heatmap_end"))
+                  )
+                )
+              ), 
+              fluidRow(
+                box(width = 12, title = "Spillerinformation i valgt cluster", status = "info", solidHeader = TRUE,
+                    DTOutput("cluster_player_table")
+                )
+              ),
+              fluidRow(
+                box(width = 12, title = "3D Visualisering af spillere i valgt cluster", status = "primary", solidHeader = TRUE,
+                    plotlyOutput("plot_3d_xplorer", height = "500px"))
+              )
+      )
+    )
+  )
+)
+
+# --- SERVER --- #
 server <- function(input, output, session) {
-  current_frame <- reactiveVal(1)
-  autoInvalidate <- reactiveTimer(1000)
-  playing <- reactiveVal(FALSE)
   
-  observe({
-    if (playing()) {
-      autoInvalidate()
-      isolate({
-        new_val <- current_frame() + 25
-        if (new_val <= nrow(tracking)) {
-          current_frame(new_val)
-          updateSliderInput(session, "frame", value = new_val)
-        }
-      })
-    }
+  kmeans_model_reactive <- reactive({
+    kmeans(pass_data_scaled, centers = input$k, nstart = 10)
   })
   
-  observeEvent(input$frame, current_frame(input$frame))
-  observeEvent(input$næste, current_frame(min(current_frame() + 1, nrow(tracking))))
-  observeEvent(input$prev, current_frame(max(current_frame() - 1, 1)))
-  observeEvent(input$play, playing(TRUE))
-  observeEvent(input$stop, playing(FALSE))
-  
-  output$plot <- renderPlot({
-    plot_tracking_frame(tracking, tracking_meta, frame_index = current_frame())
+  selected_cluster <- reactive({
+    as.character(input$cluster_choice)
   })
   
-  output$possession_plot <- renderPlot({
-    tracking_live <- tracking[1:current_frame(), ] %>%
-      filter(live == TRUE) %>%
-      mutate(teamname = case_when(
-        lastTouch == "home" ~ "VB",
-        lastTouch == "away" ~ "OB",
-        TRUE ~ NA_character_
-      )) %>%
-      filter(!is.na(teamname)) %>%
-      count(teamname, name = "antal") %>%
-      mutate(total = sum(antal),
-             procent = round(antal / total * 100))
+  output$heatmap_start <- renderPlot({
+    ggplot(allpasses %>% filter(cluster == selected_cluster())) +
+      annotate_pitch(colour = "white", fill = "gray") +
+      stat_density_2d_filled(aes(x = LOCATIONX, y = LOCATIONY), alpha = 0.7, contour_var = "ndensity") +
+      theme_pitch() +
+      labs(title = "Pass start") +
+      scale_fill_viridis_d(option = "magma")
+  })
+  
+  output$heatmap_box_title <- renderText({
+    cluster_id <- selected_cluster()
+    paste0("Heatmaps – Cluster ", cluster_id, ": ", cluster_labels[[cluster_id]]$title)
+  })
+  
+  output$heatmap_end <- renderPlot({
+    ggplot(allpasses %>% filter(cluster == selected_cluster())) +
+      annotate_pitch(colour = "white", fill = "gray") +
+      stat_density_2d_filled(aes(x = POSSESSIONENDLOCATIONX, y = POSSESSIONENDLOCATIONY), alpha = 0.7, contour_var = "ndensity") +
+      theme_pitch() +
+      labs(title = "Pass end") +
+      scale_fill_viridis_d(option = "magma")
+  })
+  
+  output$cluster_player_table <- renderDT({
+    cluster_id <- as.numeric(input$cluster_choice)
+    df <- player_stats %>%
+      filter(main_cluster == cluster_id) %>%
+      select(SHORTNAME, matches_played, total_passes,
+             avg_passes_per_match, avg_pass_angle, pass_acc) %>%
+      arrange(desc(total_passes))
     
-    ggplot(tracking_live, aes(x = 1, y = procent, fill = teamname)) +
-      geom_col(width = 2) +
-      coord_flip() +
-      geom_text(aes(label = paste0(procent, "%")), 
-                position = position_stack(vjust = 0.5), color = "white", size = 6) +
-      scale_fill_manual(values = c("OB" = "blue1", "VB" = "red1")) +
-      theme_void() +
-      theme(legend.position = "none")
+    datatable(df,
+              options = list(pageLength = 10),
+              colnames = c("Spiller", "Kampe", "Total afleveringer",
+                           "Afleveringer/kamp", "Gns vinkel", "Præcision (%)"))
+  })
+  
+  output$cluster_info_box <- renderUI({
+    cluster_id <- selected_cluster()
+    cluster_data <- allpasses %>% filter(cluster == cluster_id)
+    
+    avg_length <- round(mean(cluster_data$LENGTH, na.rm = TRUE), 1)
+    avg_angle <- round(mean(cluster_data$ANGLE, na.rm = TRUE), 1)
+    avg_player_passes <- round(mean(cluster_data$player_avgpass, na.rm = TRUE), 1)
+    avg_acc <- round(mean(cluster_data$ACCURATE, na.rm = TRUE) * 100, 1)
+    total_passes <- nrow(cluster_data)
+    
+    HTML(paste0(
+      "<div style='background:#f5f5f5;padding:10px;border-radius:5px;margin-top:10px;'>",
+      "<strong>Cluster ", cluster_id, " info</strong><br>",
+      "<b>Gennemsnitlig længde:</b> ", avg_length, "<br>",
+      "<b>Gns. vinkel:</b> ", avg_angle, "<br>",
+      "<b>Gns. spillerens passes pr kamp:</b> ", avg_player_passes, "<br>",
+      "<b>Antal pass i cluster:</b> ", total_passes, "<br>",
+      "<b>Gennemsnitlig præcision:</b> ", avg_acc, "%",
+      "</div>"
+    ))
+  })
+  
+  output$plot_3d_xplorer <- renderPlotly({
+    cluster_id <- as.numeric(input$cluster_choice)
+    
+    cluster_df <- player_stats %>% filter(main_cluster == cluster_id)
+    
+    if (nrow(cluster_df) == 0) return(plotly_empty())
+    
+    plot_ly(
+      data = cluster_df,
+      x = ~avg_pass_length,
+      y = ~avg_pass_angle,
+      z = ~pass_acc,
+      type = "scatter3d",
+      mode = "markers",
+      color = ~as.factor(main_cluster),
+      text = ~paste("Spiller:", SHORTNAME,
+                    "<br>Gns. længde:", round(avg_pass_length,1),
+                    "<br>Vinkel:", round(avg_pass_angle,1),
+                    "<br>Præcision:", round(pass_acc,1), "%"),
+      hoverinfo = "text"
+    ) %>%
+      layout(scene = list(
+        xaxis = list(title = "Gns. længde"),
+        yaxis = list(title = "Gns. vinkel"),
+        zaxis = list(title = "Præcision (%)")
+      ))
   })
 }
 
+# --- KØR APPEN --- #
 shinyApp(ui, server)
-rsconnect::deployApp()
+
